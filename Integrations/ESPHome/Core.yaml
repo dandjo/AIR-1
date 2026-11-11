@@ -144,7 +144,8 @@ globals:
     type: std::array<uint32_t, 4>
     restore_value: no
     initial_value: std::array<uint32_t, 4>{}
-  # How far co2_forced_calibration got: 0 the measurement did not stop, 1 stopped, 2 target sent, 3 target taken
+  # How far co2_forced_calibration got: 0 the measurement did not stop, 1 stopped, 2 target sent, 3 target taken,
+  # 4 target refused (the sensor answered 0xFFFF)
   - id: co2_frc_step
     type: int
     restore_value: no
@@ -820,9 +821,9 @@ script:
             - delay: 400ms
             - lambda: |-
                 uint16_t answer = 0xFFFF;
-                if (id(co2_frc_step) == 2 && id(scd40).read_data(answer) && answer != 0xFFFF) {
-                  id(co2_frc_step) = 3;
-                  ESP_LOGI("co2_calibration", "Correction %d ppm", (int) answer - 0x8000);
+                if (id(co2_frc_step) == 2 && id(scd40).read_data(answer)) {
+                  id(co2_frc_step) = answer != 0xFFFF ? 3 : 4;
+                  if (answer != 0xFFFF) ESP_LOGI("co2_calibration", "Correction %d ppm", (int) answer - 0x8000);
                 }
       # Whatever the outcome, the measurement must run again, or the CO2 would stand still: start it and check that
       # the sensor flags new data (every 5 s), up to five times
@@ -848,6 +849,10 @@ script:
             n = snprintf(buf, sizeof(buf), "Calibrated to %d ppm (was %.0f ppm)", target, before);
           } else if (id(co2_frc_step) == 0) {
             n = snprintf(buf, sizeof(buf), "Not calibrated: the sensor did not stop measuring");
+          } else if (id(co2_frc_step) == 1) {
+            n = snprintf(buf, sizeof(buf), "Not calibrated: the target did not reach the sensor");
+          } else if (id(co2_frc_step) == 2) {
+            n = snprintf(buf, sizeof(buf), "Not calibrated: the sensor did not answer");
           } else {
             n = snprintf(buf, sizeof(buf), "Not calibrated: the sensor refused it");
           }
