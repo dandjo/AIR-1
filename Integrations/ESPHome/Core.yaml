@@ -852,7 +852,8 @@ script:
           } else if (id(co2_frc_step) == 1) {
             n = snprintf(buf, sizeof(buf), "Not calibrated: the target did not reach the sensor");
           } else if (id(co2_frc_step) == 2) {
-            n = snprintf(buf, sizeof(buf), "Not calibrated: the sensor did not answer");
+            // The target reached the sensor, so it may have taken it
+            n = snprintf(buf, sizeof(buf), "Calibration outcome unknown: the sensor's answer could not be read");
           } else {
             n = snprintf(buf, sizeof(buf), "Not calibrated: the sensor refused it");
           }
