@@ -1,6 +1,6 @@
 substitutions:
   name: apollo-air-1
-  version: "26.10.16.1"
+  version: "26.11.11.1"
   device_description: ${name} made by Apollo Automation - version ${version}.
   # Default OTA password. Override in your device YAML by re-declaring
   # `substitutions: { ota_password: !secret <name>_ota_password }` so each
@@ -135,6 +135,11 @@ globals:
     restore_value: no
     type: bool
     initial_value: "false"
+  # The last four CO2 readings, newest first, for the "Calibrate CO2" button's check
+  - id: co2_recent
+    type: std::array<float, 4>
+    restore_value: no
+    initial_value: std::array<float, 4>{NAN, NAN, NAN, NAN}
 
 
 i2c:
@@ -204,6 +209,21 @@ number:
     optimistic: true
     update_interval: never
     step: 0.1
+    mode: box
+
+  - platform: template
+    name: "CO2 Calibration Target"
+    id: co2_calibration_target
+    icon: mdi:molecule-co2
+    restore_value: true
+    initial_value: 420
+    min_value: 400
+    max_value: 2000
+    entity_category: "CONFIG"
+    unit_of_measurement: "ppm"
+    optimistic: true
+    update_interval: never
+    step: 1
     mode: box
 
   - platform: template
@@ -308,6 +328,10 @@ sensor:
               lambda: 'return id(air_quality_led_source).current_option() == "CO2";'
             then:
               - script.execute: update_air_quality_led
+        - lambda: |-
+            auto &r = id(co2_recent);
+            for (int i = 3; i > 0; i--) r[i] = r[i - 1];
+            r[0] = x;
     automatic_self_calibration: true
     update_interval: 60s
     measurement_mode: "periodic"
@@ -496,13 +520,41 @@ button:
     name: "Factory Reset ESP"
     id: factory_reset_all
 
+  # Forced recalibration to "CO2 Calibration Target", the CO2 the sensor sees right now (outdoor air at an open
+  # window, or a reference meter beside it). The sensor wants >3 minutes of steady air first, so the button only
+  # calibrates when the last four readings (3 minutes) lie within 20 ppm of each other and within 100 ppm of the
+  # target; a press indoors by mistake changes nothing. "CO2 Calibration Result" says what happened.
   - platform: template
-    name: "Calibrate SCD40 To 420ppm"
+    name: "Calibrate CO2"
     id: set_SCD40_calibrate
     on_press:
-      - scd4x.perform_forced_calibration:
-          value: 420
-          id: scd40
+      - lambda: |-
+          auto &r = id(co2_recent);
+          float target = id(co2_calibration_target).state;
+          float lo = 1e9f, hi = -1e9f, sum = 0.0f;
+          bool full = true;
+          for (float v : r) {
+            if (std::isnan(v)) { full = false; break; }
+            lo = std::min(lo, v); hi = std::max(hi, v); sum += v;
+          }
+          float mean = sum / 4.0f;
+          char buf[96];
+          if (std::isnan(target)) {
+            snprintf(buf, sizeof(buf), "Not calibrated: no target");
+          } else if (!full) {
+            snprintf(buf, sizeof(buf), "Not calibrated: less than 3 minutes of readings");
+          } else if (hi - lo > 20.0f) {
+            snprintf(buf, sizeof(buf), "Not calibrated: readings not steady (%.0f-%.0f ppm)", lo, hi);
+          } else if (fabsf(mean - target) > 100.0f) {
+            snprintf(buf, sizeof(buf), "Not calibrated: %.0f ppm is too far from %.0f ppm", mean, target);
+          } else {
+            id(scd40).perform_forced_calibration((uint16_t) lroundf(target));
+            snprintf(buf, sizeof(buf), "Calibrated to %.0f ppm (was %.0f ppm)", target, r[0]);
+            // the next calibration needs three fresh minutes again
+            for (auto &v : r) v = NAN;
+          }
+          ESP_LOGI("co2_calibration", "%s", buf);
+          id(co2_calibration_result).publish_state(buf);
 
   - platform: template
     name: "Clean SEN55"
@@ -539,6 +591,13 @@ button:
                 id(deep_sleep_1).allow_deep_sleep();
 
 text_sensor:
+  - platform: template
+    name: "CO2 Calibration Result"
+    id: co2_calibration_result
+    icon: mdi:molecule-co2
+    entity_category: "diagnostic"
+    update_interval: never
+
     # Convert VOC Index To Text: 
     # https://sensirion.com/media/documents/02232963/6294E043/Info_Note_VOC_Index.pdf
     # https://sensirion.com/media/documents/ACD82D45/6294DFC0/Info_Note_Integration_VOC_NOx_Sensor.pdf
