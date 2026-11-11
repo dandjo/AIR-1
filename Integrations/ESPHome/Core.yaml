@@ -144,11 +144,16 @@ globals:
     type: std::array<uint32_t, 4>
     restore_value: no
     initial_value: std::array<uint32_t, 4>{}
-  # Whether co2_forced_calibration's command reached the sensor
-  - id: co2_frc_sent
+  # How far co2_forced_calibration got: 0 the measurement did not stop, 1 stopped, 2 target sent, 3 target taken
+  - id: co2_frc_step
+    type: int
+    restore_value: no
+    initial_value: "0"
+  # Whether the CO2 measurement runs again after co2_forced_calibration
+  - id: co2_measuring
     type: bool
     restore_value: no
-    initial_value: "false"
+    initial_value: "true"
 
 
 i2c:
@@ -559,9 +564,12 @@ button:
           }
           float mean = sum / 4.0f;
           char buf[96];
-          if (std::isnan(target)) {
+          if (id(co2_forced_calibration).is_running() || id(setCo2AutoCalibration).is_running()) {
+            snprintf(buf, sizeof(buf), "Not calibrated: the sensor is busy");
+          } else if (std::isnan(target)) {
             snprintf(buf, sizeof(buf), "Not calibrated: no target");
-          } else if (!full) {
+          } else if (!full || id(co2_recent_ms)[0] - id(co2_recent_ms)[3] < 170000) {
+            // four readings 60 s apart span 180 s; 170 s leaves room for the scheduler's jitter
             snprintf(buf, sizeof(buf), "Not calibrated: less than 3 minutes of readings");
           } else if (hi - lo > 20.0f) {
             snprintf(buf, sizeof(buf), "Not calibrated: readings not steady (%.0f-%.0f ppm)", lo, hi);
@@ -766,6 +774,8 @@ script:
             lambda: "return millis() < 20000;"
           then:
             - delay: 20s
+      #Not while a forced calibration stops and restarts the measurement
+      - script.wait: co2_forced_calibration
       #The sensor only accepts the ASC command while idle, so stop periodic
       #measurement first, then restart it. Same sequence the component uses
       #for forced calibration.
@@ -785,8 +795,8 @@ script:
 
   # The forced recalibration the "Calibrate CO2" button starts. It runs here rather than through the scd4x
   # component's perform_forced_calibration(), which does not read the sensor's answer: stop the periodic measurement,
-  # send the target (0x362F), read the correction 400 ms later (0xFFFF: refused), start the measurement again, as in
-  # the SCD4x datasheet.
+  # send the target (0x362F) only if that worked, read the correction 400 ms later (0xFFFF: refused), start the
+  # measurement again, as in the SCD4x datasheet, and report only once the sensor measures again.
   - id: co2_forced_calibration
     mode: single
     parameters:
@@ -796,31 +806,68 @@ script:
       # no reading of the component in between, whose answer would take the correction's place
       - component.suspend: scd40
       - lambda: |-
-          id(scd40).write_command((uint16_t) 0x3F86); //stop periodic measurement
-      - delay: 500ms
+          id(co2_measuring) = false;
+          id(co2_frc_step) = id(scd40).write_command((uint16_t) 0x3F86) ? 1 : 0; //stop periodic measurement
+          if (id(co2_frc_step) == 0) ESP_LOGE("co2_calibration", "Could not stop the CO2 measurement");
+      # The sensor takes the target only while idle
+      - if:
+          condition:
+            lambda: "return id(co2_frc_step) == 1;"
+          then:
+            - delay: 500ms
+            - lambda: |-
+                if (id(scd40).write_command((uint16_t) 0x362F, (uint16_t) target)) id(co2_frc_step) = 2;
+            - delay: 400ms
+            - lambda: |-
+                uint16_t answer = 0xFFFF;
+                if (id(co2_frc_step) == 2 && id(scd40).read_data(answer) && answer != 0xFFFF) {
+                  id(co2_frc_step) = 3;
+                  ESP_LOGI("co2_calibration", "Correction %d ppm", (int) answer - 0x8000);
+                }
+      # Whatever the outcome, the measurement must run again, or the CO2 would stand still: start it and check that
+      # the sensor flags new data (every 5 s), up to five times
+      - repeat:
+          count: 5
+          then:
+            - if:
+                condition:
+                  lambda: "return !id(co2_measuring);"
+                then:
+                  - lambda: |-
+                      id(scd40).write_command((uint16_t) 0x21B1); //start periodic measurement (refused while running)
+                  - delay: 6s
+                  - lambda: |-
+                      uint16_t ready = 0;
+                      bool asked = id(scd40).write_command((uint16_t) 0xE4B8); //get data ready status
+                      delay(1);
+                      id(co2_measuring) = asked && id(scd40).read_data(ready) && (ready & 0x07FF) != 0;
       - lambda: |-
-          id(co2_frc_sent) = id(scd40).write_command((uint16_t) 0x362F, (uint16_t) target);
-      - delay: 400ms
-      - lambda: |-
-          uint16_t answer = 0xFFFF;
-          bool taken = id(co2_frc_sent) && id(scd40).read_data(answer) && answer != 0xFFFF;
-          // Whatever the outcome, the measurement must run again, or the CO2 would stand still
-          bool started = false;
-          for (int i = 0; i < 3 && !started; i++) {
-            if (i > 0) delay(10);
-            started = id(scd40).write_command((uint16_t) 0x21B1); //start periodic measurement
-          }
-          if (!started) ESP_LOGE("co2_calibration", "Could not restart the CO2 measurement");
-          char buf[96];
-          if (taken) {
-            snprintf(buf, sizeof(buf), "Calibrated to %d ppm (was %.0f ppm)", target, before);
-            ESP_LOGI("co2_calibration", "%s, correction %d ppm", buf, (int) answer - 0x8000);
+          char buf[160];
+          int n;
+          if (id(co2_frc_step) == 3) {
+            n = snprintf(buf, sizeof(buf), "Calibrated to %d ppm (was %.0f ppm)", target, before);
+          } else if (id(co2_frc_step) == 0) {
+            n = snprintf(buf, sizeof(buf), "Not calibrated: the sensor did not stop measuring");
           } else {
-            snprintf(buf, sizeof(buf), "Not calibrated: the sensor refused it");
+            n = snprintf(buf, sizeof(buf), "Not calibrated: the sensor refused it");
+          }
+          if (!id(co2_measuring)) {
+            snprintf(buf + n, sizeof(buf) - n, "; the measurement did not restart, restarting the device");
+            ESP_LOGE("co2_calibration", "%s", buf);
+          } else if (id(co2_frc_step) == 3) {
+            ESP_LOGI("co2_calibration", "%s", buf);
+          } else {
             ESP_LOGW("co2_calibration", "%s", buf);
           }
           id(co2_calibration_result).publish_state(buf);
       - component.resume: scd40
+      # The last way to get the measurement going: the scd4x component starts it at boot
+      - if:
+          condition:
+            lambda: "return !id(co2_measuring);"
+          then:
+            - delay: 5s
+            - lambda: "App.safe_reboot();"
 
   - id: testScript
     then:
